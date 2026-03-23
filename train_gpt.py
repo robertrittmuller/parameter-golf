@@ -12,6 +12,7 @@ import io
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -85,6 +86,88 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+
+def format_progress_bar(current: int, total: int, width: int = 24) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    clamped = min(max(current, 0), total)
+    filled = min((clamped * width) // total, width)
+    return "[" + ("=" * filled) + ("-" * (width - filled)) + "]"
+
+
+def format_duration_ms(ms: float) -> str:
+    if ms < 1000.0:
+        return f"{ms:.0f}ms"
+    total_seconds = int(ms // 1000.0)
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{total_seconds}s"
+
+
+def format_phase_progress(phase: str, current: int, total: int) -> str:
+    return f"[{phase}] {format_progress_bar(current, total)} {min(max(current, 0), total)}/{total}"
+
+
+def read_nvidia_smi_output() -> str:
+    # `nvidia-smi` is often missing in minimal CUDA containers even when CUDA itself works.
+    if shutil.which("nvidia-smi") is None:
+        return "nvidia_smi:unavailable"
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return f"nvidia_smi:error:{exc}"
+    return result.stdout.strip() or result.stderr.strip() or "nvidia_smi:no_output"
+
+
+def validate_training_setup(args: Hyperparameters, world_size: int, grad_accum_steps: int) -> None:
+    if args.iterations < 0:
+        raise ValueError(f"ITERATIONS must be non-negative, got {args.iterations}")
+    if args.warmup_steps < 0:
+        raise ValueError(f"WARMUP_STEPS must be non-negative, got {args.warmup_steps}")
+    if args.train_seq_len <= 0:
+        raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
+    if args.train_batch_tokens <= 0:
+        raise ValueError(f"TRAIN_BATCH_TOKENS must be positive, got {args.train_batch_tokens}")
+    if args.val_batch_size <= 0:
+        raise ValueError(f"VAL_BATCH_SIZE must be positive, got {args.val_batch_size}")
+    if args.num_layers <= 0:
+        raise ValueError(f"NUM_LAYERS must be positive, got {args.num_layers}")
+    if args.model_dim <= 0:
+        raise ValueError(f"MODEL_DIM must be positive, got {args.model_dim}")
+    if args.num_heads <= 0 or args.num_kv_heads <= 0:
+        raise ValueError(
+            f"NUM_HEADS and NUM_KV_HEADS must be positive, got {args.num_heads} and {args.num_kv_heads}"
+        )
+
+    ranks_per_optimizer_step = world_size * grad_accum_steps
+    if args.train_batch_tokens % ranks_per_optimizer_step != 0:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS must be divisible by WORLD_SIZE * GRAD_ACCUM_STEPS so each rank sees "
+            f"an integral token span; got {args.train_batch_tokens} vs {world_size} * {grad_accum_steps}"
+        )
+    local_microbatch_tokens = args.train_batch_tokens // ranks_per_optimizer_step
+    if local_microbatch_tokens % args.train_seq_len != 0:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS must also produce whole sequences per rank and micro-step; "
+            f"got local_microbatch_tokens={local_microbatch_tokens} and TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_val_tokens = args.val_batch_size // ranks_per_optimizer_step
+    if local_val_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one full sequence per rank; "
+            f"got local_val_tokens={local_val_tokens} with TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -227,6 +310,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    log_fn=None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -242,13 +326,15 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
+    local_total_seqs = max(seq_end - seq_start, 0)
+    total_batches = max((local_total_seqs + local_batch_seqs - 1) // local_batch_seqs, 1)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+        for batch_idx, batch_seq_start in enumerate(range(seq_start, seq_end, local_batch_seqs), start=1):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
@@ -265,6 +351,13 @@ def eval_val(
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
+            if log_fn is not None and total_batches > 1:
+                report_every = max(total_batches // 4, 1)
+                if batch_idx == 1 or batch_idx == total_batches or batch_idx % report_every == 0:
+                    log_fn(
+                        f"{format_phase_progress('val-batch', batch_idx, total_batches)} scanning validation split",
+                        transient=True,
+                    )
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -446,16 +539,26 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, log_fn=None, dataset_name: str = ""):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.epoch = 1
         self.file_idx = 0
+        self.log_fn = log_fn
+        self.dataset_name = dataset_name
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
+        if self.file_idx == 0:
+            self.epoch += 1
+            if self.log_fn is not None:
+                self.log_fn(
+                    f"[data] dataset:{self.dataset_name or self.files[0].parent.name} "
+                    f"wrapped_to_epoch:{self.epoch} train_shards:{len(self.files)}"
+                )
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -477,11 +580,19 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(
+        self,
+        pattern: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        log_fn=None,
+        dataset_name: str = "",
+    ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -749,6 +860,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
+    validate_training_setup(args, world_size, grad_accum_steps)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
@@ -774,12 +886,30 @@ def main() -> None:
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
 
-    def log0(msg: str, console: bool = True) -> None:
+    progress_active = False
+
+    def clear_progress_line() -> None:
+        nonlocal progress_active
+        if progress_active and sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        progress_active = False
+
+    def log0(msg: str, console: bool = True, transient: bool = False) -> None:
+        nonlocal progress_active
         if not master_process:
             return
         if console:
-            print(msg)
-        if logfile is not None:
+            if transient and sys.stdout.isatty():
+                width = shutil.get_terminal_size(fallback=(120, 24)).columns
+                padded = msg[: max(width - 1, 1)].ljust(max(width - 1, 1))
+                sys.stdout.write("\r" + padded)
+                sys.stdout.flush()
+                progress_active = True
+            else:
+                clear_progress_line()
+                print(msg)
+        if logfile is not None and not transient:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
@@ -787,10 +917,7 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    log0(read_nvidia_smi_output(), console=False)
     log0("=" * 100, console=False)
 
     # -----------------------------
@@ -818,6 +945,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"[setup] run_id:{args.run_id} device:{device} distributed:{distributed} "
+        f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -913,7 +1044,14 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        log_fn=log0,
+        dataset_name=dataset_dir.name,
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -951,14 +1089,25 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(
+                    f"{format_phase_progress('warmup', warmup_step + 1, args.warmup_steps)} "
+                    "priming compiled forward/backward/update paths",
+                    transient=True,
+                )
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            log_fn=log0,
+            dataset_name=dataset_dir.name,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -988,10 +1137,13 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                log_fn=log0,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"{format_phase_progress('val', step, args.iterations)} "
+                f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"train_time:{format_duration_ms(training_time_ms)} "
+                f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1041,8 +1193,11 @@ def main() -> None:
         )
         if should_log_train:
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{format_phase_progress('train', step, args.iterations)} "
+                f"train_loss:{train_loss.item():.4f} lr_mul:{scale:.4f} "
+                f"muon_momentum:{muon_momentum:.4f} train_time:{format_duration_ms(approx_training_time_ms)} "
+                f"step_avg:{approx_training_time_ms / step:.2f}ms",
+                transient=True,
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1055,8 +1210,8 @@ def main() -> None:
             stop_after_step = step
 
     log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        f"[summary] peak_memory_allocated:{torch.cuda.max_memory_allocated() // 1024 // 1024}MiB "
+        f"peak_memory_reserved:{torch.cuda.max_memory_reserved() // 1024 // 1024}MiB"
     )
 
     # -----------------------------
@@ -1064,6 +1219,7 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    log0("[save] writing raw and quantized checkpoints")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1110,6 +1266,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        log_fn=log0,
     )
     torch.cuda.synchronize()
     log0(

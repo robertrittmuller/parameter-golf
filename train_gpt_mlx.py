@@ -11,6 +11,7 @@ import json
 import math
 import os
 import pickle
+import shutil
 import sys
 import time
 import uuid
@@ -118,6 +119,81 @@ class Hyperparameters:
         warmdown_ms = self.warmdown_iters * step_ms
         remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+
+def format_progress_bar(current: int, total: int, width: int = 24) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    clamped = min(max(current, 0), total)
+    filled = min((clamped * width) // total, width)
+    return "[" + ("=" * filled) + ("-" * (width - filled)) + "]"
+
+
+def format_duration_ms(ms: float) -> str:
+    if ms < 1000.0:
+        return f"{ms:.0f}ms"
+    total_seconds = int(ms // 1000.0)
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{total_seconds}s"
+
+
+def format_phase_progress(phase: str, current: int, total: int) -> str:
+    return f"[{phase}] {format_progress_bar(current, total)} {min(max(current, 0), total)}/{total}"
+
+
+def validate_training_setup(args: Hyperparameters) -> None:
+    if args.iterations < 0:
+        raise ValueError(f"ITERATIONS must be non-negative, got {args.iterations}")
+    if args.warmup_steps < 0:
+        raise ValueError(f"WARMUP_STEPS must be non-negative, got {args.warmup_steps}")
+    if args.grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {args.grad_accum_steps}")
+    if args.train_seq_len <= 0:
+        raise ValueError(f"TRAIN_SEQ_LEN must be positive, got {args.train_seq_len}")
+    if args.train_batch_tokens <= 0:
+        raise ValueError(f"TRAIN_BATCH_TOKENS must be positive, got {args.train_batch_tokens}")
+    if args.val_batch_size <= 0:
+        raise ValueError(f"VAL_BATCH_SIZE must be positive, got {args.val_batch_size}")
+    if args.num_layers <= 0:
+        raise ValueError(f"NUM_LAYERS must be positive, got {args.num_layers}")
+    if args.model_dim <= 0:
+        raise ValueError(f"MODEL_DIM must be positive, got {args.model_dim}")
+    if args.num_heads <= 0 or args.num_kv_heads <= 0:
+        raise ValueError(
+            f"NUM_HEADS and NUM_KV_HEADS must be positive, got {args.num_heads} and {args.num_kv_heads}"
+        )
+    if args.train_batch_tokens % args.grad_accum_steps != 0:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS must be divisible by GRAD_ACCUM_STEPS so each accumulation step sees "
+            f"an integral token budget; got {args.train_batch_tokens} vs {args.grad_accum_steps}"
+        )
+    if args.microbatch_tokens % args.train_seq_len != 0:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS / GRAD_ACCUM_STEPS must resolve to whole sequences; "
+            f"got microbatch_tokens={args.microbatch_tokens} and TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+    if val_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one full sequence after splitting across accumulation steps; "
+            f"got val_batch_tokens={val_batch_tokens} and TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+
+
+def describe_chunk_plan(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> str:
+    chunks = token_chunks(total_tokens, seq_len, max_chunk_tokens)
+    counts: dict[int, int] = {}
+    for chunk in chunks:
+        counts[chunk] = counts.get(chunk, 0) + 1
+    return " + ".join(
+        f"{count}x{chunk}" if count > 1 else str(chunk)
+        for chunk, count in sorted(counts.items(), reverse=True)
+    )
 
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -235,7 +311,7 @@ class TokenStream:
             self.epoch += 1
             if self.log_fn is not None:
                 self.log_fn(
-                    f"WARNING: starting epoch:{self.epoch} "
+                    f"[data] wrapped_to_epoch:{self.epoch} "
                     f"dataset:{self.dataset_name} train_shards:{len(self.files)}"
                 )
         self.tokens = load_data_shard(self.files[self.file_idx])
@@ -805,9 +881,12 @@ def eval_val(
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
         if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+            batch_idx == 1 or batch_idx == total_batches or batch_idx % max(total_batches // 4, 1) == 0
         ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+            log_fn(
+                f"{format_phase_progress('val-batch', batch_idx, total_batches)} scanning validation split",
+                transient=True,
+            )
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
@@ -838,16 +917,36 @@ def main() -> None:
     # TOKENIZER + VALIDATION METRIC SETUP
     # ==============================================================================
     args = Hyperparameters()
+    validate_training_setup(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
     print(logfile)
 
-    def log(msg: str, console: bool = True) -> None:
+    progress_active = False
+
+    def clear_progress_line() -> None:
+        nonlocal progress_active
+        if progress_active and sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        progress_active = False
+
+    def log(msg: str, console: bool = True, transient: bool = False) -> None:
+        nonlocal progress_active
         if console:
-            print(msg)
-        with logfile.open("a", encoding="utf-8") as f:
-            print(msg, file=f)
+            if transient and sys.stdout.isatty():
+                width = shutil.get_terminal_size(fallback=(120, 24)).columns
+                padded = msg[: max(width - 1, 1)].ljust(max(width - 1, 1))
+                sys.stdout.write("\r" + padded)
+                sys.stdout.flush()
+                progress_active = True
+            else:
+                clear_progress_line()
+                print(msg)
+        if not transient:
+            with logfile.open("a", encoding="utf-8") as f:
+                print(msg, file=f)
 
     code = Path(__file__).read_text(encoding="utf-8")
     log(code, console=False)
@@ -918,6 +1017,7 @@ def main() -> None:
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
+    log(f"[setup] log_file:{logfile}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
     if expected_train_files is None:
@@ -943,6 +1043,9 @@ def main() -> None:
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
+    log(
+        f"[setup] chunk_plan_per_microbatch:{describe_chunk_plan(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)}"
+    )
     log(
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
@@ -975,7 +1078,11 @@ def main() -> None:
             mx.eval(warmup_loss, accum)
             mx.synchronize()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log(
+                    f"{format_phase_progress('warmup', warmup_step + 1, args.warmup_steps)} "
+                    "priming compiled train/eval graphs",
+                    transient=True,
+                )
 
         # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
         val_batch_tokens = args.val_batch_size // args.grad_accum_steps
@@ -1014,11 +1121,12 @@ def main() -> None:
                 is_boundary_token_lut,
                 log_fn=log,
             )
-            if step % 25 == 0 or last_step:
-                log(
-                    f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                    f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
-                )
+            log(
+                f"{format_phase_progress('val', step, args.iterations)} "
+                f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"train_time:{format_duration_ms(train_time_ms)} "
+                f"step_avg:{train_time_ms / max(step, 1):.2f}ms"
+            )
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -1050,8 +1158,11 @@ def main() -> None:
         step += 1
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
-                f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"{format_phase_progress('train', step, args.iterations)} "
+                f"train_loss:{train_loss_value:.4f} lr_mul:{lr_mul:.4f} "
+                f"train_time:{format_duration_ms(approx_train_time_ms)} "
+                f"step_avg:{approx_train_time_ms / step:.2f}ms step_ms:{step_ms:.2f} tok_s:{tok_s:.0f}",
+                transient=True,
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
@@ -1062,6 +1173,7 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
+    log("[save] writing raw and quantized MLX checkpoints")
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
