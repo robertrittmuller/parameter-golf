@@ -19,6 +19,11 @@ import zlib
 from collections.abc import Callable
 from pathlib import Path
 
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
 import numpy as np
 import sentencepiece as spm
 
@@ -65,7 +70,7 @@ class Hyperparameters:
     # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 3000))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
@@ -74,7 +79,7 @@ class Hyperparameters:
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -82,18 +87,21 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Optimizer. We keep the same per-group defaults as train_gpt.py.
+    # Optimizer. These defaults mirror the quantization-friendly schedule in
+    # train_gpt.py without changing model size or export format.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
-    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.035))
+    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.025))
+    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_weight_decay: float = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
+    adam_weight_decay: float = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.04))
+    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -554,14 +562,17 @@ class Muon:
             g_eff = g + momentum * buf
             g_ortho = zeropower_newtonschulz5(g_eff, self.args.muon_backend_steps)
             scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
-            out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
+            update = lr * (g_ortho * scale).astype(p.dtype)
+            if self.args.muon_weight_decay > 0:
+                update = update + lr * self.args.muon_weight_decay * p
+            out[k] = p - update
         return out
 
 
 class SplitOptimizers:
-    # - embeddings: Adam with the tied-embedding LR
+    # - embeddings: Adam with the tied-embedding LR + explicit decoupled decay
     # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
+    # - block scalars + skip weights: Adam + explicit decoupled decay
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
@@ -599,27 +610,34 @@ class SplitOptimizers:
 
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
-        self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
+        embed_lr = self.args.tied_embed_lr * lr_mul
+        self.adam_embed.learning_rate = embed_lr
+        embed_updates = self.adam_embed.apply_gradients(
+            {self.embed_key: grads[self.embed_key]},
+            {self.embed_key: params[self.embed_key]},
         )
+        if self.args.adam_weight_decay > 0:
+            embed_updates[self.embed_key] = embed_updates[self.embed_key] - embed_lr * self.args.adam_weight_decay * params[self.embed_key]
+        updated.update(embed_updates)
 
-        self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
+        scalar_lr = self.args.scalar_lr * lr_mul
+        self.adam_scalar.learning_rate = scalar_lr
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
         scalar_params = {k: params[k] for k in self.scalar_keys}
-        updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
+        scalar_updates = self.adam_scalar.apply_gradients(scalar_grads, scalar_params)
+        if self.args.adam_weight_decay > 0:
+            for key, value in scalar_updates.items():
+                scalar_updates[key] = value - scalar_lr * self.args.adam_weight_decay * scalar_params[key]
+        updated.update(scalar_updates)
 
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# QUANTIZATION (LOW-BIT + ZSTD/ZLIB)
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
+# - int5/int6 for large MLP/attention matrices
+# - int8 for the remaining large float tensors
+# - fp16/fp32 passthrough for small or sensitive tensors
 # - exact passthrough for non-floats
 
 MX_DTYPE_FROM_NAME = {
@@ -628,11 +646,21 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
-INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+FP16_KEEP_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",")
+    if pattern
+)
+LOWBIT_KEEP_FLOAT_MAX_NUMEL = 65_536
+LOWBIT_KEEP_FLOAT_STORE_DTYPE = np.float16
+LOWBIT_PER_ROW_SCALE_DTYPE = np.float16
+LOWBIT_INT8_CLIP_PERCENTILE = 99.99984
+LOWBIT_INT8_CLIP_Q = LOWBIT_INT8_CLIP_PERCENTILE / 100.0
+LOWBIT_MLP_BITS = int(os.environ.get("LOWBIT_MLP_BITS", 5))
+LOWBIT_ATTN_BITS = int(os.environ.get("LOWBIT_ATTN_BITS", 6))
+LOWBIT_OTHER_BITS = int(os.environ.get("LOWBIT_OTHER_BITS", 8))
+LOWBIT_ZSTD_LEVEL = int(os.environ.get("LOWBIT_ZSTD_LEVEL", 22))
+LOWBIT_COMPRESSOR = "zstd" if zstandard is not None else "zlib"
 
 
 def _np_float32(arr: mx.array) -> np.ndarray:
@@ -644,29 +672,63 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
         return np.ascontiguousarray(_np_float32(arr))
     if arr.dtype in {mx.float32, mx.bfloat16}:
         passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
-        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
+        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=LOWBIT_KEEP_FLOAT_STORE_DTYPE, copy=False))
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+def classify_lowbit_tensor(name: str) -> str:
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".mlp." in name:
+        return "mlp"
+    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+        return "attn"
+    return "other"
+
+
+def quantize_int8_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
+        clip_abs = np.quantile(np.abs(f32), LOWBIT_INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(LOWBIT_PER_ROW_SCALE_DTYPE, copy=False))
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
+    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), LOWBIT_INT8_CLIP_Q)) if f32.size else 0.0
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
     q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_lowbit_array(arr: mx.array, bits: int) -> tuple[np.ndarray, np.ndarray]:
+    clip = (1 << (bits - 1)) - 1
+    low = -(clip + 1)
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        row_max = np.max(np.abs(f32), axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
+        scale = np.maximum(row_max / clip, 1e-12).astype(LOWBIT_PER_ROW_SCALE_DTYPE, copy=False)
+        q = np.clip(np.round(f32 / scale[:, None]), low, clip).astype(np.int8, copy=False)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale)
+    amax = float(np.max(np.abs(f32))) if f32.size else 0.0
+    scale = np.array(max(amax / clip, 1e-12), dtype=np.float32)
+    q = np.clip(np.round(f32 / scale), low, clip).astype(np.int8, copy=False)
+    return np.ascontiguousarray(q), scale
+
+
+def choose_lowbit_width(name: str, arr: mx.array) -> int:
+    category = classify_lowbit_tensor(name)
+    if category == "mlp" and arr.ndim >= 2:
+        return LOWBIT_MLP_BITS
+    if category == "attn" and arr.ndim >= 2:
+        return LOWBIT_ATTN_BITS
+    return LOWBIT_OTHER_BITS
+
+
+def quantize_state_dict_lowbit(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -674,7 +736,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "lowbit_payload_bytes"),
         0,
     )
     for name, arr in flat_state.items():
@@ -684,27 +746,34 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         if not mx.issubdtype(arr.dtype, mx.floating):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = np.ascontiguousarray(np.array(arr))
-            stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
+            stats["lowbit_payload_bytes"] += int(passthrough[name].nbytes)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if int(arr.size) <= LOWBIT_KEEP_FLOAT_MAX_NUMEL or any(pattern in name for pattern in FP16_KEEP_NAME_PATTERNS):
             kept = keep_float_array(name, arr, passthrough_orig_dtypes)
             passthrough[name] = kept
-            stats["int8_payload_bytes"] += int(kept.nbytes)
+            stats["lowbit_payload_bytes"] += int(kept.nbytes)
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        bits = choose_lowbit_width(name, arr)
+        if bits >= 8:
+            q, s = quantize_int8_array(arr)
+        else:
+            q, s = quantize_lowbit_array(arr, bits=bits)
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            qmeta[name] = {"scheme": "per_row", "axis": 0, "bits": bits}
+        else:
+            qmeta[name] = {"scheme": "per_tensor", "bits": bits}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(arr.dtype).split(".")[-1]
-        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
+        stats["lowbit_payload_bytes"] += int(q.nbytes + s.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "lowbit_clean_per_row_v2",
+        "compressor": LOWBIT_COMPRESSOR,
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -717,7 +786,7 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     return obj, stats
 
 
-def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
+def dequantize_state_dict_lowbit(quant_obj: dict[str, object]) -> dict[str, mx.array]:
     out: dict[str, mx.array] = {}
     qmeta = quant_obj.get("qmeta", {})
     passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
@@ -740,6 +809,18 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         else:
             out[name] = mx.array(out_arr)
     return out
+
+
+def compress_payload(raw: bytes) -> bytes:
+    if LOWBIT_COMPRESSOR == "zstd" and zstandard is not None:
+        return zstandard.ZstdCompressor(level=LOWBIT_ZSTD_LEVEL).compress(raw)
+    return zlib.compress(raw, level=9)
+
+
+def decompress_payload(blob: bytes) -> bytes:
+    if LOWBIT_COMPRESSOR == "zstd" and zstandard is not None:
+        return zstandard.ZstdDecompressor().decompress(blob)
+    return zlib.decompress(blob)
 
 
 def build_sentencepiece_luts(
@@ -1050,7 +1131,8 @@ def main() -> None:
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps} "
+        f"muon_wd:{args.muon_weight_decay} adam_wd:{args.adam_weight_decay}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
@@ -1179,23 +1261,23 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_obj, quant_stats = quantize_state_dict_lowbit(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = compress_payload(quant_raw)
     quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+    quant_path = out_dir / f"{args.run_id}_mlx_model.lowbit.ptz"
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["lowbit_payload_bytes"], 1)
     log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        f"serialized_model_lowbit_{LOWBIT_COMPRESSOR}:{quant_file_bytes} bytes "
+        f"(payload:{quant_stats['lowbit_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_flat = dequantize_state_dict_lowbit(pickle.loads(decompress_payload(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1208,8 +1290,8 @@ def main() -> None:
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(f"final_lowbit_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(f"final_lowbit_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
