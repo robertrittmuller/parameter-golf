@@ -96,6 +96,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "0" if sys.version_info >= (3, 14) else "1")))
 
 
 def format_progress_bar(current: int, total: int, width: int = 24) -> str:
@@ -178,6 +179,12 @@ def validate_training_setup(args: Hyperparameters, world_size: int, grad_accum_s
             "VAL_BATCH_SIZE must provide at least one full sequence per rank; "
             f"got local_val_tokens={local_val_tokens} with TRAIN_SEQ_LEN={args.train_seq_len}"
         )
+
+
+def maybe_compile(module_or_fn, enabled: bool, *, dynamic: bool = False, fullgraph: bool = True):
+    if not enabled:
+        return module_or_fn
+    return torch.compile(module_or_fn, dynamic=dynamic, fullgraph=fullgraph)
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -934,7 +941,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5 = maybe_compile(zeropower_via_newtonschulz5, args.torch_compile)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1061,7 +1068,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = maybe_compile(base_model, args.torch_compile, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1119,6 +1126,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"execution_mode:{'compiled' if args.torch_compile else 'eager'}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1168,7 +1176,7 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
+    # Warmup primes the active forward/backward/optimizer path, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -1189,7 +1197,7 @@ def main() -> None:
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(
                     f"{format_phase_progress('warmup', warmup_step + 1, args.warmup_steps)} "
-                    "priming compiled forward/backward/update paths",
+                    f"priming {'compiled' if args.torch_compile else 'eager'} forward/backward/update paths",
                     transient=True,
                 )
         base_model.load_state_dict(initial_model_state, strict=True)
