@@ -2,6 +2,8 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
+Keep the reference architecture aligned between `train_gpt.py` and `train_gpt_mlx.py`. The MLX path is useful for local iteration on Apple Silicon, while the PyTorch/CUDA path is useful for faster iteration on Nvidia machines, so architecture changes should be mirrored across both scripts unless a backend-specific limitation is explicitly documented.
+
 Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 from __future__ import annotations
