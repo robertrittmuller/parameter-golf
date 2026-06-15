@@ -96,6 +96,16 @@ python3 train_gpt_mlx.py
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
 
+### Architecture Visualization
+
+If you want a visual map of the baseline MLX model, generate the standalone HTML5 architecture view:
+
+```bash
+python3 tools/generate_train_gpt_mlx_viz.py
+```
+
+This writes `artifacts/train_gpt_mlx_architecture.html`, a self-contained interactive diagram of the `train_gpt_mlx.py` model topology, block internals, skip connections, and parameter breakdown.
+
 ### Scaling Up to a Remote Machine
 
 Once you're happy with your local tests, or you want more compute, switch to a remote CUDA machine.

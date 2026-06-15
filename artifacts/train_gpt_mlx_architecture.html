@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>train_gpt_mlx Architecture</title>
+  <style>
+    :root {
+      --bg: #f6efe4;
+      --panel: rgba(255, 251, 245, 0.86);
+      --ink: #1d2733;
+      --muted: #5b6a78;
+      --line: rgba(29, 39, 51, 0.14);
+      --shadow: 0 18px 45px rgba(50, 38, 24, 0.12);
+      --encoder: #0f766e;
+      --encoder-soft: #c8efe9;
+      --decoder: #c05621;
+      --decoder-soft: #ffe1d0;
+      --shared: #305f72;
+      --shared-soft: #dcebf2;
+      --io: #8b6f1f;
+      --io-soft: #f5ebbf;
+      --accent: #7f1d1d;
+      --grid: rgba(48, 95, 114, 0.08);
+      --heat-low: #dbe9f5;
+      --heat-high: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 30%),
+        radial-gradient(circle at top right, rgba(192, 86, 33, 0.12), transparent 28%),
+        linear-gradient(180deg, #faf4ea 0%, #f2e8d7 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      max-width: 1820px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .hero {
+      display: flex;
+      gap: 24px;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 20px;
+    }
+
+    .hero-copy {
+      max-width: 900px;
+    }
+
+    .eyebrow {
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+      color: var(--accent);
+      margin-bottom: 10px;
+      font-weight: 700;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 4vw, 4.2rem);
+      line-height: 0.96;
+      margin: 0 0 12px;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      font-size: 1.04rem;
+      line-height: 1.55;
+      color: var(--muted);
+      max-width: 760px;
+      margin: 0;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(130px, 1fr));
+      gap: 12px;
+      min-width: 420px;
+    }
+
+    .stat {
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      border-radius: 20px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .stat-label {
+      font-family: "SFMono-Regular", "Roboto Mono", "Menlo", monospace;
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .stat-value {
+      font-size: 1.55rem;
+      font-weight: 700;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(760px, 1.3fr) minmax(320px, 0.72fr);
+      gap: 22px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: 26px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      overflow: hidden;
+    }
+
+    .canvas-panel {
+      min-height: 980px;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      gap: 14px 18px;
+      align-items: start;
+      padding: 18px 20px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .toolbar-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid rgba(29, 39, 51, 0.12);
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+      transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(29, 39, 51, 0.24);
+      background: rgba(255, 255, 255, 0.96);
+    }
+
+    button.active {
+      background: var(--ink);
+      color: #fffdf8;
+      border-color: var(--ink);
+    }
+
+    .toolbar-note {
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.45;
+      min-height: 52px;
+      max-height: 52px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      text-align: right;
+    }
+
+    #diagramWrap {
+      padding: 12px 14px 18px;
+    }
+
+    svg {
+      width: 100%;
+      height: 880px;
+      display: block;
+      border-radius: 22px;
+      background:
+        linear-gradient(180deg, rgba(255, 251, 245, 0.96), rgba(245, 239, 228, 0.88));
+      touch-action: none;
+    }
+
+    .grid-line {
+      stroke: var(--grid);
+      stroke-width: 1;
+    }
+
+    .edge {
+      fill: none;
+      stroke: rgba(29, 39, 51, 0.34);
+      stroke-width: 3;
+      stroke-linecap: round;
+      transition: stroke 120ms ease, stroke-width 120ms ease, opacity 120ms ease;
+    }
+
+    .edge.skip {
+      stroke: rgba(127, 29, 29, 0.42);
+      stroke-dasharray: 8 8;
+    }
+
+    .edge.residual {
+      stroke: rgba(48, 95, 114, 0.28);
+      stroke-dasharray: 5 7;
+      stroke-width: 2.5;
+    }
+
+    .edge.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .edge.active {
+      stroke: var(--accent);
+      stroke-width: 5;
+      opacity: 1;
+    }
+
+    .node {
+      cursor: pointer;
+    }
+
+    .node rect {
+      stroke: rgba(29, 39, 51, 0.18);
+      stroke-width: 2;
+      rx: 22;
+      transition: transform 120ms ease, stroke 120ms ease, filter 120ms ease;
+      filter: drop-shadow(0 12px 18px rgba(29, 39, 51, 0.08));
+    }
+
+    .node:hover rect {
+      stroke: rgba(29, 39, 51, 0.45);
+    }
+
+    .node.active rect {
+      stroke: var(--accent);
+      stroke-width: 4;
+      filter: drop-shadow(0 14px 22px rgba(127, 29, 29, 0.16));
+    }
+
+    .node-label {
+      fill: var(--ink);
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .node-meta {
+      fill: var(--muted);
+      font-family: "SFMono-Regular", "Roboto Mono", "Menlo", monospace;
+      font-size: 14px;
+    }
+
+    .node-chip {
+      fill: rgba(255, 255, 255, 0.78);
+      stroke: rgba(29, 39, 51, 0.08);
+      stroke-width: 1;
+      rx: 10;
+    }
+
+    .node-chip-text {
+      fill: var(--ink);
+      font-family: "SFMono-Regular", "Roboto Mono", "Menlo", monospace;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .banner {
+      fill: rgba(255, 255, 255, 0.58);
+      stroke: rgba(48, 95, 114, 0.2);
+      stroke-width: 2;
+      rx: 18;
+    }
+
+    .banner-title {
+      fill: var(--shared);
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .banner-subtitle {
+      fill: var(--muted);
+      font-size: 14px;
+    }
+
+    .detail-panel {
+      padding: 20px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .detail-card {
+      border: 1px solid rgba(29, 39, 51, 0.1);
+      border-radius: 20px;
+      padding: 18px;
+      background: rgba(255, 255, 255, 0.58);
+    }
+
+    .detail-kicker {
+      font-family: "SFMono-Regular", "Roboto Mono", "Menlo", monospace;
+      font-size: 0.74rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .detail-title {
+      font-size: 1.6rem;
+      margin: 0 0 8px;
+      line-height: 1.08;
+    }
+
+    .detail-text {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.98rem;
+    }
+
+    .mini-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .mini-stat {
+      border: 1px solid rgba(29, 39, 51, 0.08);
+      border-radius: 16px;
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.7);
+    }
+
+    .mini-stat .label {
+      display: block;
+      font-size: 0.76rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-family: "SFMono-Regular", "Roboto Mono", "Menlo", monospace;
+    }
+
+    .mini-stat .value {
+      font-size: 1.1rem;
+      font-weight: 700;
+    }
+
+    .fact-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .fact {
+      border-left: 4px solid rgba(48, 95, 114, 0.45);
+      padding-left: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .fact strong {
+      color: var(--ink);
+    }
+
+    .bar {
+      margin-top: 12px;
+    }
+
+    .bar-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.9rem;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+
+    .bar-track {
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(29, 39, 51, 0.08);
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--shared), var(--accent));
+    }
+
+    #blockSvg {
+      width: 100%;
+      height: 240px;
+      display: block;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(248, 242, 234, 0.94));
+      border: 1px solid rgba(29, 39, 51, 0.08);
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .legend-item {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .swatch {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 1px solid rgba(29, 39, 51, 0.1);
+      flex: 0 0 auto;
+    }
+
+    .footer-note {
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1280px) {
+      .hero {
+        flex-direction: column;
+      }
+
+      .stats {
+        min-width: 0;
+        width: 100%;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .canvas-panel {
+        min-height: auto;
+      }
+
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar-note {
+        justify-content: flex-start;
+        text-align: left;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">Interactive Architecture Map</div>
+        <h1>train_gpt_mlx.py</h1>
+        <p class="subtitle">
+          A self-contained view of the baseline MLX model: tied embeddings, a U-Net-like split transformer stack,
+          grouped-query attention, learned residual controls, and a decoder that consumes reversed skip states.
+          Hover to inspect, click to pin, drag to pan, and use the controls to expose skip structure and parameter density.
+        </p>
+      </div>
+      <div class="stats" id="heroStats"></div>
+    </section>
+
+    <section class="layout">
+      <div class="panel canvas-panel">
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <button id="colorStage" class="active">Color: Stage</button>
+            <button id="colorParams">Color: Params</button>
+            <button id="toggleSkips" class="active">Show Skip Bridges</button>
+            <button id="toggleResiduals" class="active">Show x0 Residual Fan-Out</button>
+            <button id="resetView">Reset View</button>
+          </div>
+          <div class="toolbar-note" id="toolbarNote"></div>
+        </div>
+        <div id="diagramWrap">
+          <svg id="overview" viewBox="0 0 1960 1100" aria-label="Architecture overview"></svg>
+        </div>
+      </div>
+
+      <aside class="panel">
+        <div class="detail-panel">
+          <section class="detail-card" id="selectionCard"></section>
+          <section class="detail-card">
+            <div class="detail-kicker">Selected Block Schematic</div>
+            <svg id="blockSvg" viewBox="0 0 900 240" aria-label="Block schematic"></svg>
+          </section>
+          <section class="detail-card">
+            <div class="detail-kicker">Key Levers</div>
+            <div id="featureList"></div>
+          </section>
+          <section class="detail-card">
+            <div class="detail-kicker">Legend</div>
+            <div class="legend">
+              <div class="legend-item"><span class="swatch" style="background: var(--encoder-soft);"></span>Encoder stack</div>
+              <div class="legend-item"><span class="swatch" style="background: var(--decoder-soft);"></span>Decoder stack</div>
+              <div class="legend-item"><span class="swatch" style="background: var(--shared-soft);"></span>Shared or control state</div>
+              <div class="legend-item"><span class="swatch" style="background: var(--io-soft);"></span>Input/output path</div>
+            </div>
+          </section>
+          <section class="detail-card">
+            <p class="footer-note" id="footerNote"></p>
+          </section>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <script>
+    const architecture = {"source_path":"/Users/robertrittmuller/projects/parameter-golf/train_gpt_mlx.py","source_lines":{"attention":379,"mlp":425,"block":438,"gpt":466},"defaults":{"train_seq_len":1024,"vocab_size":1024,"num_layers":9,"model_dim":512,"num_heads":8,"num_kv_heads":4,"mlp_mult":3,"tie_embeddings":true,"tied_embed_init_std":0.005,"logit_softcap":30.0,"rope_base":10000.0,"qk_gain_init":1.5},"derived":{"head_dim":64,"kv_dim":256,"hidden_dim":1536,"num_encoder_layers":4,"num_decoder_layers":5,"num_skip_weights":4,"total_params":21778504},"components":{"embedding_params":524288,"attention_params_per_block":786432,"mlp_params_per_block":1572864,"control_params_per_block":2056,"per_block_params":2361352,"blocks_total_params":21252168,"skip_weights_params":2048},"blocks":[{"id":"block_0","label":"Block 1","global_index":0,"stage":"encoder","stage_index":0,"params":2361352,"skip_from":null},{"id":"block_1","label":"Block 2","global_index":1,"stage":"encoder","stage_index":1,"params":2361352,"skip_from":null},{"id":"block_2","label":"Block 3","global_index":2,"stage":"encoder","stage_index":2,"params":2361352,"skip_from":null},{"id":"block_3","label":"Block 4","global_index":3,"stage":"encoder","stage_index":3,"params":2361352,"skip_from":null},{"id":"block_4","label":"Block 5","global_index":4,"stage":"decoder","stage_index":0,"params":2361352,"skip_from":{"label":"Block 4","global_index":3}},{"id":"block_5","label":"Block 6","global_index":5,"stage":"decoder","stage_index":1,"params":2361352,"skip_from":{"label":"Block 3","global_index":2}},{"id":"block_6","label":"Block 7","global_index":6,"stage":"decoder","stage_index":2,"params":2361352,"skip_from":{"label":"Block 2","global_index":1}},{"id":"block_7","label":"Block 8","global_index":7,"stage":"decoder","stage_index":3,"params":2361352,"skip_from":{"label":"Block 1","global_index":0}},{"id":"block_8","label":"Block 9","global_index":8,"stage":"decoder","stage_index":4,"params":2361352,"skip_from":null}],"features":[{"title":"U-Net-like depth split","body":"Depth 9 is split into 4 encoder blocks and 5 decoder blocks. Decoder blocks consume skips in reverse order."},{"title":"Grouped-query attention","body":"Queries use 8 heads while keys and values use only 4 heads, shrinking KV projection width to 256 without changing query width."},{"title":"Per-block parameter hotspot","body":"The MLP contributes 1,572,864 parameters per block, or 66.6% of block parameters."},{"title":"Residual control surfaces","body":"`resid_mix`, `attn_scale`, `mlp_scale`, and `q_gain` add only 2,056 parameters per block, making them cheap levers for architectural experiments."},{"title":"Shared embedding/output matrix","body":"The embedding table holds 524,288 parameters and is reused as the output head, so vocabulary or width changes affect both ends of the model."},{"title":"Stability-biased initialization","body":"Attention and MLP output projections are zero-initialized, keeping the early network close to identity."},{"title":"Normalized rotary attention","body":"Queries and keys are RMS-normalized before RoPE, then scaled by per-head `q_gain` initialized to 1.5."}]};
+    const state = {
+      selectedId: "model",
+      colorMode: "stage",
+      showSkips: true,
+      showResiduals: true,
+      scale: 1,
+      panX: 0,
+      panY: 0,
+    };
+
+    const svg = document.getElementById("overview");
+    const selectionCard = document.getElementById("selectionCard");
+    const featureList = document.getElementById("featureList");
+    const heroStats = document.getElementById("heroStats");
+    const toolbarNote = document.getElementById("toolbarNote");
+    const footerNote = document.getElementById("footerNote");
+    const blockSvg = document.getElementById("blockSvg");
+    let viewport;
+    let pointerDrag = null;
+
+    function formatInt(value) {
+      return new Intl.NumberFormat("en-US").format(value);
+    }
+
+    function formatCompact(value) {
+      return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(value);
+    }
+
+    function formatPercent(value, digits = 1) {
+      return `${(value * 100).toFixed(digits)}%`;
+    }
+
+    function createSvg(tag, attrs = {}) {
+      const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+      return node;
+    }
+
+    function estimateTextWidth(text, fontSize, weight = 400) {
+      const factor = weight >= 700 ? 0.62 : 0.56;
+      return text.length * fontSize * factor;
+    }
+
+    function truncateToWidth(text, maxWidth, fontSize, weight = 400) {
+      if (estimateTextWidth(text, fontSize, weight) <= maxWidth) return text;
+      const ellipsis = "…";
+      let out = text;
+      while (out.length > 1 && estimateTextWidth(out + ellipsis, fontSize, weight) > maxWidth) {
+        out = out.slice(0, -1);
+      }
+      return `${out}${ellipsis}`;
+    }
+
+    function wrapLabelLines(text, maxWidth, fontSize) {
+      if (estimateTextWidth(text, fontSize, 700) <= maxWidth) {
+        return [text];
+      }
+      const words = text.split(" ");
+      if (words.length === 1) {
+        return [truncateToWidth(text, maxWidth, fontSize, 700)];
+      }
+      let first = "";
+      let index = 0;
+      while (index < words.length) {
+        const candidate = first ? `${first} ${words[index]}` : words[index];
+        if (estimateTextWidth(candidate, fontSize, 700) > maxWidth) break;
+        first = candidate;
+        index += 1;
+      }
+      if (!first) {
+        return [truncateToWidth(text, maxWidth, fontSize, 700)];
+      }
+      const remaining = words.slice(index).join(" ");
+      if (!remaining) return [first];
+      return [first, truncateToWidth(remaining, maxWidth, fontSize, 700)];
+    }
+
+    function stageColors(kind, ratio) {
+      if (state.colorMode === "params") {
+        const t = Math.max(0, Math.min(1, ratio));
+        const r = Math.round(219 + (180 - 219) * t);
+        const g = Math.round(233 + (35 - 233) * t);
+        const b = Math.round(245 + (24 - 245) * t);
+        return `rgb(${r}, ${g}, ${b})`;
+      }
+      if (kind === "encoder") return "var(--encoder-soft)";
+      if (kind === "decoder") return "var(--decoder-soft)";
+      if (kind === "io") return "var(--io-soft)";
+      return "var(--shared-soft)";
+    }
+
+    function buildNodes() {
+      const nodes = [];
+      const encX = 560;
+      const decX = 1120;
+      const blockW = 270;
+      const blockH = 102;
+      const encStartY = 150;
+      const encGap = 148;
+      const decStartY = 760;
+      const decGap = 132;
+
+      nodes.push({
+        id: "input",
+        label: "Input Tokens",
+        subtitle: `batch x ${architecture.defaults.train_seq_len} tokens`,
+        meta: `vocab ${architecture.defaults.vocab_size}`,
+        kind: "io",
+        x: 40,
+        y: 96,
+        w: 170,
+        h: 76,
+        params: 0,
+        description: "Integer token ids enter as a sequence matrix. The script uses a fixed sequence length for training batches.",
+      });
+
+      nodes.push({
+        id: "tok_emb",
+        label: "Token Embedding",
+        subtitle: `${architecture.defaults.vocab_size} x ${architecture.defaults.model_dim}`,
+        meta: `${formatInt(architecture.components.embedding_params)} params`,
+        kind: "io",
+        x: 245,
+        y: 82,
+        w: 248,
+        h: 104,
+        params: architecture.components.embedding_params,
+        description: "The embedding table is learned once and later reused as the LM head weight matrix. The embedded activations are RMS-normalized immediately.",
+      });
+
+      nodes.push({
+        id: "x0_bus",
+        label: "x0 Residual Reference",
+        subtitle: "shared embedded baseline",
+        meta: "fed into every block via resid_mix",
+        kind: "shared",
+        x: 270,
+        y: 244,
+        w: 198,
+        h: 82,
+        params: 0,
+        description: "Each transformer block blends its current state with the original embedded input `x0` before attention runs.",
+      });
+
+      for (const block of architecture.blocks.filter((item) => item.stage === "encoder")) {
+        nodes.push({
+          id: block.id,
+          label: block.label,
+          subtitle: `${block.stage} block`,
+          meta: `${formatCompact(block.params)} params`,
+          kind: "encoder",
+          x: encX,
+          y: encStartY + block.stage_index * encGap,
+          w: blockW,
+          h: blockH,
+          params: block.params,
+          block,
+          description: "Pre-normalized attention + ReLU^2 MLP block. Encoder blocks also push their outputs onto the skip stack.",
+        });
+      }
+
+      nodes.push({
+        id: "bottleneck",
+        label: "Stack Handoff",
+        subtitle: "encoder output enters decoder",
+        meta: `${architecture.derived.num_skip_weights} learned skip gates`,
+        kind: "shared",
+        x: 864,
+        y: 718,
+        w: 200,
+        h: 86,
+        params: architecture.components.skip_weights_params,
+        description: "The model keeps encoder activations in a stack, then pops them in reverse order while stepping through decoder blocks.",
+      });
+
+      for (const block of architecture.blocks.filter((item) => item.stage === "decoder")) {
+        nodes.push({
+          id: block.id,
+          label: block.label,
+          subtitle: `${block.stage} block`,
+          meta: `${formatCompact(block.params)} params`,
+          kind: "decoder",
+          x: decX,
+          y: decStartY - block.stage_index * decGap,
+          w: blockW,
+          h: blockH,
+          params: block.params,
+          block,
+          description: block.skip_from
+            ? "Decoder block consumes a reversed encoder skip, then runs the same attention + MLP block."
+            : "Odd layer counts leave the final decoder block without a matching skip input.",
+        });
+      }
+
+      nodes.push({
+        id: "final_norm",
+        label: "Final RMSNorm",
+        subtitle: "weightless normalization",
+        meta: "no learned params",
+        kind: "shared",
+        x: 1458,
+        y: 92,
+        w: 188,
+        h: 76,
+        params: 0,
+        description: "The final hidden state is RMS-normalized before the tied output projection is used inside the loss path.",
+      });
+
+      nodes.push({
+        id: "lm_head",
+        label: "Tied LM Head",
+        subtitle: "x @ tok_emb^T",
+        meta: `softcap ${architecture.defaults.logit_softcap}`,
+        kind: "io",
+        x: 1676,
+        y: 80,
+        w: 206,
+        h: 100,
+        params: 0,
+        description: "No separate output matrix is created. The normalized activations multiply the embedding table transpose, and logits are softly capped before cross-entropy.",
+      });
+
+      nodes.push({
+        id: "logits",
+        label: "Logits / Loss",
+        subtitle: "cross-entropy over flattened tokens",
+        meta: architecture.defaults.tie_embeddings ? "tied output path" : "untied output path",
+        kind: "io",
+        x: 1888,
+        y: 96,
+        w: 170,
+        h: 76,
+        params: 0,
+        description: "Training computes cross-entropy over flattened tokens, optionally chunking logits for memory control.",
+      });
+
+      return nodes;
+    }
+
+    function nodeMap(nodes) {
+      return new Map(nodes.map((node) => [node.id, node]));
+    }
+
+    function buildEdges(nodesById) {
+      const edges = [
+        { id: "e_input_emb", from: "input", to: "tok_emb", type: "main" },
+        { id: "e_emb_enc0", from: "tok_emb", to: architecture.blocks[0].id, type: "main" },
+        { id: "e_emb_x0", from: "tok_emb", to: "x0_bus", type: "residual" },
+      ];
+
+      const encoderBlocks = architecture.blocks.filter((item) => item.stage === "encoder");
+      const decoderBlocks = architecture.blocks.filter((item) => item.stage === "decoder");
+      for (let i = 0; i < encoderBlocks.length - 1; i += 1) {
+        edges.push({ id: `e_enc_${i}`, from: encoderBlocks[i].id, to: encoderBlocks[i + 1].id, type: "main" });
+      }
+      edges.push({ id: "e_enc_bridge", from: encoderBlocks[encoderBlocks.length - 1].id, to: "bottleneck", type: "main" });
+      edges.push({ id: "e_bridge_dec0", from: "bottleneck", to: decoderBlocks[0].id, type: "main" });
+      for (let i = 0; i < decoderBlocks.length - 1; i += 1) {
+        edges.push({ id: `e_dec_${i}`, from: decoderBlocks[i].id, to: decoderBlocks[i + 1].id, type: "main" });
+      }
+      edges.push({ id: "e_dec_norm", from: decoderBlocks[decoderBlocks.length - 1].id, to: "final_norm", type: "main" });
+      edges.push({ id: "e_norm_head", from: "final_norm", to: "lm_head", type: "main" });
+      edges.push({ id: "e_head_logits", from: "lm_head", to: "logits", type: "main" });
+
+      for (const block of architecture.blocks) {
+        edges.push({ id: `e_x0_${block.id}`, from: "x0_bus", to: block.id, type: "residual" });
+      }
+
+      for (const block of decoderBlocks) {
+        if (!block.skip_from) continue;
+        edges.push({
+          id: `e_skip_${block.id}`,
+          from: `block_${block.skip_from.global_index}`,
+          to: block.id,
+          type: "skip",
+        });
+      }
+
+      return edges.map((edge) => ({
+        ...edge,
+        fromNode: nodesById.get(edge.from),
+        toNode: nodesById.get(edge.to),
+      }));
+    }
+
+    function edgePath(edge) {
+      const from = edge.fromNode;
+      const to = edge.toNode;
+      if (edge.type === "main") {
+        const fromX = from.x + from.w;
+        const fromY = from.y + from.h / 2;
+        const toX = to.x;
+        const toY = to.y + to.h / 2;
+        const dx = Math.max(70, (toX - fromX) * 0.45);
+        return `M ${fromX} ${fromY} C ${fromX + dx} ${fromY}, ${toX - dx} ${toY}, ${toX} ${toY}`;
+      }
+      if (edge.type === "residual") {
+        const fromX = from.x + from.w / 2;
+        const fromY = from.y + from.h;
+        const toX = to.x + to.w / 2;
+        const toY = to.y;
+        const midY = (fromY + toY) / 2;
+        return `M ${fromX} ${fromY} C ${fromX} ${midY}, ${toX} ${midY}, ${toX} ${toY}`;
+      }
+      const fromX = edge.fromNode.x + edge.fromNode.w;
+      const fromY = edge.fromNode.y + edge.fromNode.h / 2;
+      const toX = edge.toNode.x;
+      const toY = edge.toNode.y + edge.toNode.h / 2;
+      const ctrl1X = fromX + 210;
+      const ctrl2X = toX - 210;
+      const lift = Math.min(fromY, toY) - 120;
+      return `M ${fromX} ${fromY} C ${ctrl1X} ${lift}, ${ctrl2X} ${lift}, ${toX} ${toY}`;
+    }
+
+    function drawGrid(root) {
+      for (let x = 0; x <= 1960; x += 120) {
+        root.appendChild(createSvg("line", { x1: x, y1: 0, x2: x, y2: 1100, class: "grid-line" }));
+      }
+      for (let y = 0; y <= 1100; y += 110) {
+        root.appendChild(createSvg("line", { x1: 0, y1: y, x2: 1960, y2: y, class: "grid-line" }));
+      }
+    }
+
+    function drawBanner(root) {
+      const banner = createSvg("g");
+      banner.appendChild(createSvg("rect", { x: 468, y: 42, width: 996, height: 78, class: "banner" }));
+      const title = createSvg("text", { x: 496, y: 72, class: "banner-title" });
+      title.textContent = "Topology: encoder stack pushes skips, decoder stack pops them in reverse";
+      banner.appendChild(title);
+      const subtitle = createSvg("text", { x: 496, y: 99, class: "banner-subtitle" });
+      subtitle.textContent = `Defaults: ${architecture.defaults.num_layers} layers = ${architecture.derived.num_encoder_layers} encoder + ${architecture.derived.num_decoder_layers} decoder`;
+      banner.appendChild(subtitle);
+      root.appendChild(banner);
+    }
+
+    function renderOverview() {
+      svg.innerHTML = "";
+      viewport = createSvg("g", { id: "viewport" });
+      svg.appendChild(viewport);
+
+      drawGrid(viewport);
+      drawBanner(viewport);
+
+      const nodes = buildNodes();
+      const nodesById = nodeMap(nodes);
+      const edges = buildEdges(nodesById);
+
+      const maxParams = Math.max(...nodes.map((node) => node.params || 0), 1);
+      const selected = state.selectedId;
+
+      for (const edge of edges) {
+        const path = createSvg("path", {
+          d: edgePath(edge),
+          class: `edge ${edge.type}${(edge.type === "skip" && !state.showSkips) || (edge.type === "residual" && !state.showResiduals) ? " hidden" : ""}`,
+        });
+        if (selected && (edge.from === selected || edge.to === selected)) {
+          path.classList.add("active");
+        }
+        path.dataset.from = edge.from;
+        path.dataset.to = edge.to;
+        viewport.appendChild(path);
+      }
+
+      for (const node of nodes) {
+        const ratio = (node.params || 0) / maxParams;
+        const group = createSvg("g", { class: `node${node.id === selected ? " active" : ""}` });
+        group.dataset.id = node.id;
+        const chipW = node.params ? Math.min(node.w - 28, Math.max(72, (`${node.params > 1000 ? formatCompact(node.params) : `${node.params}`}`.length * 8) + 22)) : 0;
+        const labelMaxWidth = node.params ? node.w - chipW - 54 : node.w - 36;
+        const metaMaxWidth = node.w - 36;
+        const labelLines = wrapLabelLines(node.label, labelMaxWidth, 22);
+
+        const rect = createSvg("rect", {
+          x: node.x,
+          y: node.y,
+          width: node.w,
+          height: node.h,
+          fill: stageColors(node.kind, ratio),
+        });
+        group.appendChild(rect);
+
+        labelLines.forEach((line, lineIndex) => {
+          const label = createSvg("text", {
+            x: node.x + 18,
+            y: node.y + 34 + (lineIndex * 22),
+            class: "node-label",
+          });
+          label.textContent = line;
+          group.appendChild(label);
+        });
+
+        const subtitle = createSvg("text", {
+          x: node.x + 18,
+          y: node.y + (labelLines.length === 2 ? 79 : 61),
+          class: "node-meta",
+        });
+        subtitle.textContent = truncateToWidth(node.subtitle, metaMaxWidth, 14, 400);
+        group.appendChild(subtitle);
+
+        const meta = createSvg("text", {
+          x: node.x + 18,
+          y: node.y + (labelLines.length === 2 ? 99 : 83),
+          class: "node-meta",
+        });
+        meta.textContent = truncateToWidth(node.meta, metaMaxWidth, 14, 400);
+        group.appendChild(meta);
+
+        if (node.params) {
+          group.appendChild(createSvg("rect", {
+            x: node.x + node.w - chipW - 14,
+            y: node.y + 12,
+            width: chipW,
+            height: 24,
+            class: "node-chip",
+          }));
+          const chipText = createSvg("text", {
+            x: node.x + node.w - chipW + 2,
+            y: node.y + 29,
+            class: "node-chip-text",
+          });
+          chipText.textContent = truncateToWidth(node.params > 1000 ? formatCompact(node.params) : `${node.params}`, chipW - 18, 13, 600);
+          group.appendChild(chipText);
+        }
+
+        group.addEventListener("click", () => {
+          state.selectedId = node.id;
+          renderOverview();
+          renderSelection();
+        });
+        group.addEventListener("mouseenter", () => {
+          toolbarNote.textContent = node.description;
+        });
+        group.addEventListener("mouseleave", () => {
+          toolbarNote.textContent = selectionSubtitle();
+        });
+        viewport.appendChild(group);
+      }
+
+      applyTransform();
+    }
+
+    function selectionSubtitle() {
+      if (state.selectedId === "model") {
+        return "Model selected. Click a block to inspect the reusable transformer cell.";
+      }
+      const block = architecture.blocks.find((item) => item.id === state.selectedId);
+      if (block) {
+        return `${block.label}: ${block.stage} stage, ${formatInt(block.params)} parameters.`;
+      }
+      return "Click a node to pin its detail card.";
+    }
+
+    function renderHeroStats() {
+      const cards = [
+        { label: "Total Params", value: formatInt(architecture.derived.total_params) },
+        { label: "Depth Split", value: `${architecture.derived.num_encoder_layers}E / ${architecture.derived.num_decoder_layers}D` },
+        { label: "Attention Shape", value: `${architecture.defaults.num_heads}q / ${architecture.defaults.num_kv_heads}kv` },
+        { label: "Hidden Width", value: `${architecture.defaults.model_dim}` },
+        { label: "MLP Width", value: `${architecture.derived.hidden_dim}` },
+        { label: "Seq Length", value: `${architecture.defaults.train_seq_len}` },
+      ];
+      heroStats.innerHTML = cards.map((card) => `
+        <div class="stat">
+          <div class="stat-label">${card.label}</div>
+          <div class="stat-value">${card.value}</div>
+        </div>
+      `).join("");
+    }
+
+    function bars(items, total) {
+      return items.map((item) => `
+        <div class="bar">
+          <div class="bar-label"><span>${item.label}</span><span>${formatInt(item.value)} · ${formatPercent(item.value / total)}</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:${(item.value / total) * 100}%"></div></div>
+        </div>
+      `).join("");
+    }
+
+    function renderSelection() {
+      const block = architecture.blocks.find((item) => item.id === state.selectedId);
+      const total = architecture.derived.total_params;
+      if (!block && state.selectedId !== "model") {
+        renderAuxSelection(state.selectedId);
+        return;
+      }
+
+      if (state.selectedId === "model") {
+        selectionCard.innerHTML = `
+          <div class="detail-kicker">Whole Model</div>
+          <h2 class="detail-title">Baseline MLX GPT with skip-bridged depth</h2>
+          <p class="detail-text">
+            The stack is not a plain decoder-only transformer. It first runs an encoder half, saves intermediate
+            activations, then runs a decoder half that pops those activations in reverse through learned per-channel
+            skip weights. Every block also sees the original embedded input through <code>resid_mix</code>.
+          </p>
+          <div class="mini-stats">
+            <div class="mini-stat"><span class="label">Block Params</span><span class="value">${formatCompact(architecture.components.per_block_params)}</span></div>
+            <div class="mini-stat"><span class="label">Skip Params</span><span class="value">${formatInt(architecture.components.skip_weights_params)}</span></div>
+            <div class="mini-stat"><span class="label">Embedding Share</span><span class="value">${formatPercent(architecture.components.embedding_params / total)}</span></div>
+            <div class="mini-stat"><span class="label">Tied Output</span><span class="value">${architecture.defaults.tie_embeddings ? "yes" : "no"}</span></div>
+          </div>
+          ${bars([
+            { label: "All transformer blocks", value: architecture.components.blocks_total_params },
+            { label: "Embedding matrix", value: architecture.components.embedding_params },
+            { label: "Skip weights", value: architecture.components.skip_weights_params },
+          ], total)}
+        `;
+        renderBlockSchematic(null);
+        footerNote.textContent = `Source: ${architecture.source_path}. Generated from the script defaults and model definitions without importing MLX.`;
+        toolbarNote.textContent = selectionSubtitle();
+        return;
+      }
+
+      selectionCard.innerHTML = `
+        <div class="detail-kicker">${block.stage} Block</div>
+        <h2 class="detail-title">${block.label}</h2>
+        <p class="detail-text">
+          Each block first blends its current state with the original embedded baseline <code>x0</code>, then runs
+          normalized attention and a ReLU squared MLP with learned per-channel output scales. The only topology change
+          between blocks is whether a reversed skip is added before the decoder block executes.
+        </p>
+        <div class="mini-stats">
+          <div class="mini-stat"><span class="label">Parameters</span><span class="value">${formatInt(block.params)}</span></div>
+          <div class="mini-stat"><span class="label">Head Dim</span><span class="value">${architecture.derived.head_dim}</span></div>
+          <div class="mini-stat"><span class="label">Hidden MLP</span><span class="value">${architecture.derived.hidden_dim}</span></div>
+          <div class="mini-stat"><span class="label">Skip Input</span><span class="value">${block.skip_from ? `from ${block.skip_from.label}` : "none"}</span></div>
+        </div>
+        ${bars([
+          { label: "Attention projections", value: architecture.components.attention_params_per_block },
+          { label: "MLP projections", value: architecture.components.mlp_params_per_block },
+          { label: "Control vectors", value: architecture.components.control_params_per_block },
+        ], block.params)}
+      `;
+      renderBlockSchematic(block);
+      footerNote.textContent = `Zero-initialized attention and MLP output projections make the initial block behavior close to identity, which is useful when probing architectural changes.`;
+      toolbarNote.textContent = selectionSubtitle();
+    }
+
+    function renderAuxSelection(id) {
+      const descriptions = {
+        input: {
+          kicker: "Input Path",
+          title: "Token ids enter as dense sequences",
+          text: "The loader emits `(batch, seq_len)` integer tensors. The sequence length is fixed by the training hyperparameters, so architecture changes that affect context length need to account for batching and chunking logic elsewhere in the script.",
+        },
+        tok_emb: {
+          kicker: "Shared Weights",
+          title: "Embedding table doubles as the output head",
+          text: "This is the cheapest large matrix in the model because it is used twice: once for lookup and once for the final projection. Any vocabulary or width change immediately affects both ends of the network.",
+        },
+        x0_bus: {
+          kicker: "Reference Stream",
+          title: "Every block can fall back to the original embedding",
+          text: "The `resid_mix` tensor has shape `(2, dim)` and mixes the running hidden state with the original input embedding. That is a lightweight but unusual control surface for depth experiments.",
+        },
+        bottleneck: {
+          kicker: "Skip Stack",
+          title: "Encoder outputs are stored and popped in reverse",
+          text: "The bridge is tiny in parameter count. Almost all of the structural effect comes from where the skip activations are injected, not from the learned gate tensor itself.",
+        },
+        final_norm: {
+          kicker: "Final Projection Prep",
+          title: "Weightless RMSNorm before the tied head",
+          text: "This normalizes the hidden state without adding another learned vector. In this script the output path stays as lean as possible.",
+        },
+        lm_head: {
+          kicker: "Output Path",
+          title: "Tied projection with a soft logit cap",
+          text: "The LM head is implemented inside `loss()` by multiplying against `tok_emb.weight.T` and applying a tanh softcap before cross-entropy. That cap is a stabilizing knob worth preserving if you widen the model.",
+        },
+        logits: {
+          kicker: "Training Objective",
+          title: "Cross-entropy can be chunked for memory",
+          text: "Chunking the logit projection does not alter topology, but it matters when experimenting with wider hidden states or larger sequence lengths on memory-limited machines.",
+        },
+      };
+      const info = descriptions[id];
+      selectionCard.innerHTML = `
+        <div class="detail-kicker">${info.kicker}</div>
+        <h2 class="detail-title">${info.title}</h2>
+        <p class="detail-text">${info.text}</p>
+        <div class="fact-list">
+          <div class="fact"><strong>Model width:</strong> ${architecture.defaults.model_dim}</div>
+          <div class="fact"><strong>Sequence length:</strong> ${architecture.defaults.train_seq_len}</div>
+          <div class="fact"><strong>Tied embeddings:</strong> ${architecture.defaults.tie_embeddings ? "enabled" : "disabled"}</div>
+        </div>
+      `;
+      renderBlockSchematic(null);
+      footerNote.textContent = `Click any encoder or decoder block for the reusable cell structure and exact parameter split.`;
+      toolbarNote.textContent = selectionSubtitle();
+    }
+
+    function renderFeatures() {
+      featureList.innerHTML = architecture.features.map((feature) => `
+        <div class="fact">
+          <strong>${feature.title}.</strong> ${feature.body}
+        </div>
+      `).join("");
+    }
+
+    function drawSchematicBadge(root, x, y, text, fill) {
+      const width = Math.max(82, (text.length * 8) + 28);
+      root.appendChild(createSvg("rect", {
+        x,
+        y,
+        width,
+        height: 28,
+        rx: 14,
+        fill,
+        stroke: "rgba(29,39,51,0.1)",
+        "stroke-width": 1,
+      }));
+      const label = createSvg("text", {
+        x: x + 14,
+        y: y + 19,
+        fill: "var(--ink)",
+        "font-size": "13",
+        "font-weight": "700",
+        "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace",
+      });
+      label.textContent = text;
+      root.appendChild(label);
+    }
+
+    function renderBlockSchematic(block) {
+      blockSvg.innerHTML = "";
+      const root = createSvg("g");
+      blockSvg.appendChild(root);
+      const stageLabel = block ? `${block.label} (${block.stage})` : "Reusable transformer block";
+      const stageFill = !block ? "var(--shared-soft)" : (block.stage === "encoder" ? "var(--encoder-soft)" : "var(--decoder-soft)");
+      const stageText = createSvg("text", { x: 28, y: 28, fill: "var(--ink)", "font-size": "22", "font-weight": "700" });
+      stageText.textContent = stageLabel;
+      root.appendChild(stageText);
+      const stageMeta = createSvg("text", {
+        x: 28,
+        y: 50,
+        fill: "var(--muted)",
+        "font-size": "13",
+        "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace",
+      });
+      stageMeta.textContent = block
+        ? `global_index=${block.global_index + 1}/${architecture.defaults.num_layers} head_dim=${architecture.derived.head_dim} hidden=${architecture.derived.hidden_dim}`
+        : `shared cell used by ${architecture.defaults.num_layers} blocks`;
+      root.appendChild(stageMeta);
+
+      drawSchematicBadge(root, 690, 18, block ? block.stage.toUpperCase() : "BLOCK CELL", stageFill);
+      if (block && block.skip_from) {
+        drawSchematicBadge(root, 792, 18, `skip:${block.skip_from.label}`, "rgba(127, 29, 29, 0.14)");
+      } else if (block && block.stage === "decoder") {
+        drawSchematicBadge(root, 786, 18, "tail:no skip", "rgba(48, 95, 114, 0.12)");
+      } else if (block && block.stage === "encoder") {
+        drawSchematicBadge(root, 786, 18, "pushes skip", "rgba(15, 118, 110, 0.12)");
+      }
+
+      const nodes = [
+        { x: 26, y: 70, w: 124, h: 60, fill: "var(--shared-soft)", label: "x + x0 mix", meta: "resid_mix" },
+        { x: 176, y: 70, w: 170, h: 60, fill: stageFill, label: "Attention", meta: "RMSNorm -> qkv" },
+        { x: 372, y: 70, w: 170, h: 60, fill: stageFill, label: "RoPE + SDPA", meta: `${architecture.defaults.num_heads}q / ${architecture.defaults.num_kv_heads}kv` },
+        { x: 568, y: 70, w: 136, h: 60, fill: "var(--shared-soft)", label: "Residual Add", meta: "attn_scale" },
+        { x: 730, y: 70, w: 140, h: 60, fill: stageFill, label: "MLP", meta: "ReLU^2" },
+        { x: 730, y: 152, w: 140, h: 56, fill: "var(--shared-soft)", label: "Residual Add", meta: "mlp_scale" },
+      ];
+
+      for (const node of nodes) {
+        root.appendChild(createSvg("rect", {
+          x: node.x,
+          y: node.y,
+          width: node.w,
+          height: node.h,
+          rx: 16,
+          fill: node.fill,
+          stroke: "rgba(29,39,51,0.12)",
+          "stroke-width": 1.5,
+        }));
+        const label = createSvg("text", { x: node.x + 14, y: node.y + 26, fill: "var(--ink)", "font-size": "18", "font-weight": "700" });
+        label.textContent = node.label;
+        root.appendChild(label);
+        const meta = createSvg("text", { x: node.x + 14, y: node.y + 46, fill: "var(--muted)", "font-size": "13", "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace" });
+        meta.textContent = node.meta;
+        root.appendChild(meta);
+      }
+
+      const arrows = [
+        [150, 100, 176, 100],
+        [346, 100, 372, 100],
+        [542, 100, 568, 100],
+        [704, 100, 730, 100],
+        [800, 130, 800, 152],
+      ];
+      for (const [x1, y1, x2, y2] of arrows) {
+        root.appendChild(createSvg("line", {
+          x1, y1, x2, y2,
+          stroke: "rgba(29,39,51,0.45)",
+          "stroke-width": 3,
+          "stroke-linecap": "round",
+        }));
+      }
+
+      if (block && block.skip_from) {
+        root.appendChild(createSvg("rect", {
+          x: 26,
+          y: 150,
+          width: 148,
+          height: 56,
+          rx: 16,
+          fill: "rgba(127, 29, 29, 0.08)",
+          stroke: "rgba(127, 29, 29, 0.24)",
+          "stroke-width": 1.5,
+        }));
+        const skipLabel = createSvg("text", {
+          x: 40,
+          y: 175,
+          fill: "var(--ink)",
+          "font-size": "17",
+          "font-weight": "700",
+        });
+        skipLabel.textContent = "Reversed Skip";
+        root.appendChild(skipLabel);
+        const skipMeta = createSvg("text", {
+          x: 40,
+          y: 194,
+          fill: "var(--muted)",
+          "font-size": "13",
+          "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace",
+        });
+        skipMeta.textContent = `${block.skip_from.label} via skip_weights`;
+        root.appendChild(skipMeta);
+        root.appendChild(createSvg("line", {
+          x1: 174,
+          y1: 178,
+          x2: 248,
+          y2: 178,
+          stroke: "rgba(127,29,29,0.55)",
+          "stroke-width": 3,
+          "stroke-linecap": "round",
+          "stroke-dasharray": "7 7",
+        }));
+        const plus = createSvg("text", {
+          x: 254,
+          y: 184,
+          fill: "var(--accent)",
+          "font-size": "20",
+          "font-weight": "700",
+        });
+        plus.textContent = "+";
+        root.appendChild(plus);
+      } else if (block && block.stage === "encoder") {
+        root.appendChild(createSvg("rect", {
+          x: 572,
+          y: 150,
+          width: 170,
+          height: 56,
+          rx: 16,
+          fill: "rgba(15, 118, 110, 0.08)",
+          stroke: "rgba(15, 118, 110, 0.24)",
+          "stroke-width": 1.5,
+        }));
+        const skipStore = createSvg("text", {
+          x: 586,
+          y: 175,
+          fill: "var(--ink)",
+          "font-size": "17",
+          "font-weight": "700",
+        });
+        skipStore.textContent = "Push To Skip Stack";
+        root.appendChild(skipStore);
+        const skipStoreMeta = createSvg("text", {
+          x: 586,
+          y: 194,
+          fill: "var(--muted)",
+          "font-size": "13",
+          "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace",
+        });
+        skipStoreMeta.textContent = `${block.label} output saved for decoder`;
+        root.appendChild(skipStoreMeta);
+      } else if (block && block.stage === "decoder") {
+        root.appendChild(createSvg("rect", {
+          x: 26,
+          y: 150,
+          width: 184,
+          height: 56,
+          rx: 16,
+          fill: "rgba(48, 95, 114, 0.08)",
+          stroke: "rgba(48, 95, 114, 0.24)",
+          "stroke-width": 1.5,
+        }));
+        const tailLabel = createSvg("text", {
+          x: 40,
+          y: 175,
+          fill: "var(--ink)",
+          "font-size": "17",
+          "font-weight": "700",
+        });
+        tailLabel.textContent = "Decoder Tail";
+        root.appendChild(tailLabel);
+        const tailMeta = createSvg("text", {
+          x: 40,
+          y: 194,
+          fill: "var(--muted)",
+          "font-size": "13",
+          "font-family": "SFMono-Regular, Roboto Mono, Menlo, monospace",
+        });
+        tailMeta.textContent = "runs without a paired encoder skip";
+        root.appendChild(tailMeta);
+      }
+
+      const note = createSvg("text", { x: 28, y: 216, fill: "var(--muted)", "font-size": "13" });
+      note.textContent = block && block.skip_from
+        ? `Decoder-only addition: add learned skip from ${block.skip_from.label} before entering the block.`
+        : block && block.stage === "encoder"
+          ? "Encoder blocks push their post-block activations onto the skip stack for later reverse-order reuse."
+          : block && block.stage === "decoder"
+            ? "This decoder tail block has no matching encoder skip because the default depth is odd."
+            : "Attention output projection and MLP output projection are zero-initialized in the constructor.";
+      root.appendChild(note);
+    }
+
+    function applyTransform() {
+      if (!viewport) return;
+      viewport.setAttribute("transform", `translate(${state.panX} ${state.panY}) scale(${state.scale})`);
+    }
+
+    function resetView() {
+      state.scale = 1;
+      state.panX = 0;
+      state.panY = 0;
+      applyTransform();
+    }
+
+    svg.addEventListener("pointerdown", (event) => {
+      if (event.target.closest(".node")) return;
+      pointerDrag = {
+        x: event.clientX,
+        y: event.clientY,
+        panX: state.panX,
+        panY: state.panY,
+      };
+      svg.setPointerCapture(event.pointerId);
+    });
+
+    svg.addEventListener("pointermove", (event) => {
+      if (!pointerDrag) return;
+      state.panX = pointerDrag.panX + (event.clientX - pointerDrag.x);
+      state.panY = pointerDrag.panY + (event.clientY - pointerDrag.y);
+      applyTransform();
+    });
+
+    svg.addEventListener("pointerup", () => {
+      pointerDrag = null;
+    });
+
+    svg.addEventListener("pointerleave", () => {
+      pointerDrag = null;
+    });
+
+    svg.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const delta = event.deltaY < 0 ? 1.08 : 0.92;
+      state.scale = Math.max(0.58, Math.min(1.95, state.scale * delta));
+      applyTransform();
+    }, { passive: false });
+
+    document.getElementById("toggleSkips").addEventListener("click", (event) => {
+      state.showSkips = !state.showSkips;
+      event.currentTarget.classList.toggle("active", state.showSkips);
+      renderOverview();
+    });
+
+    document.getElementById("toggleResiduals").addEventListener("click", (event) => {
+      state.showResiduals = !state.showResiduals;
+      event.currentTarget.classList.toggle("active", state.showResiduals);
+      renderOverview();
+    });
+
+    document.getElementById("colorStage").addEventListener("click", () => {
+      state.colorMode = "stage";
+      document.getElementById("colorStage").classList.add("active");
+      document.getElementById("colorParams").classList.remove("active");
+      renderOverview();
+    });
+
+    document.getElementById("colorParams").addEventListener("click", () => {
+      state.colorMode = "params";
+      document.getElementById("colorParams").classList.add("active");
+      document.getElementById("colorStage").classList.remove("active");
+      renderOverview();
+    });
+
+    document.getElementById("resetView").addEventListener("click", resetView);
+
+    renderHeroStats();
+    renderFeatures();
+    renderOverview();
+    renderSelection();
+    toolbarNote.textContent = selectionSubtitle();
+  </script>
+</body>
+</html>
